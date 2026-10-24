@@ -43,6 +43,8 @@ known_modes.update({
     'frame-boundary', 'cancel-write-failure', 'cancel-duplicate-acceptance', 'event-then-disconnect',
     'cancel-before-timeout', 'cancel-before-disconnect',
     'batched-split-frames', 'accepted-then-rejected', 'close-term-cleanup',
+    'ack-eof-recorder',
+    'ack-eof-recorder-positive',
     'event-order', 'host-cancel-before-acceptance-hang',
     'host-cancel-after-acceptance-hang', 'host-cancel-no-terminal-hang',
     'host-cancel-late-terminal',
@@ -293,6 +295,41 @@ if mode == 'cancel-write-failure':
     send(event())
     send(event(sequence=1, final=True))
     write_receipt()
+    sys.exit(0)
+if mode == 'ack-eof-recorder-positive':
+    # Positive control for the recorder below: the event is applied, so the
+    # host ACKs it; record frames until that ACK arrives, then finish with a
+    # final and keep recording until stdin EOF. A recorder that never records
+    # (wrong key, stdin not read) would leave this record empty.
+    assert receipt is not None
+    send(event())
+    acks = []
+    sent_final = False
+    for line in sys.stdin:
+        if line.strip():
+            frame = json.loads(line)
+            acks.append({key: frame.get(key)
+                         for key in ('method', 'lastAppliedSequence')})
+            if not sent_final and frame.get('method') == 'ack':
+                send(event(sequence=1, final=True))
+                sent_final = True
+    receipt.with_suffix('.acks').write_text(json.dumps(acks) + '\n')
+    sys.exit(0)
+if mode == 'ack-eof-recorder':
+    # Wire ACK receipt for the lifecycle-rejection path: emit one applicable
+    # event, then record every host frame until stdin EOF instead of blocking
+    # on the expected ACK read. A host that ACKs a validation-rejected event
+    # (or writes anything else before closing) is exposed in the .acks record;
+    # the Rust test asserts that record is empty after the failed execute.
+    assert receipt is not None
+    send(event())
+    acks = []
+    for line in sys.stdin:
+        if line.strip():
+            frame = json.loads(line)
+            acks.append({key: frame.get(key)
+                         for key in ('method', 'lastAppliedSequence')})
+    receipt.with_suffix('.acks').write_text(json.dumps(acks) + '\n')
     sys.exit(0)
 if mode.startswith('cancel-'):
     local_abort = mode != 'cancel-compaction-no-local'
