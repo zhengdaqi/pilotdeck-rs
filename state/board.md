@@ -1,7 +1,7 @@
 # PilotDeck-RS：把 PilotDeck 后端从 TypeScript 重写为 Rust · 状态板（给 AI · 跨会话唯一接续点）
 
 <!-- READY:BEGIN -->
-updated: 2026-10-24 13:50 · by 协调者(Claude Code 交互·opus-5.5·/loop)
+updated: 2026-10-25 03:57 · by GLM(glm-5.3-mb·#589 fix-r4)
 - gate-#275 | coord | blocked | #275 闸门作者谱系：draft,待非draft后处理
 - #150 | coord | human | draft PR,待人定
 - #19 | coord | human | 人定暂缓(10-17)
@@ -18,9 +18,21 @@ updated: 2026-10-24 13:50 · by 协调者(Claude Code 交互·opus-5.5·/loop)
 - #587 | impl | doing | A6.9-pr3d 上下文与持久资源接入factory；aa1a052d0d0c5e6b9
 - #586 | impl | doing | A6.9-pr3c2 交互与hooks资源接入factory；ae8e582bd5d62ea93
 - #588 | impl | doing | A6.9-pr3e 插件与customRouter接入factory；a65f64068c70051b3
-- #589 | impl | ready | A7.2-pr6a LiveSession+SubmitHost（待核pr3c-3e状态）
+- #589 | impl | doing | A7.2-pr6a LiveSession事件完整性接线；fix-r4 收尾（对端 ACK 收据证明校验拒绝不被 ACK+premature-ACK负控转红、Grok P2-2 消费证据闭环、红探针安全配方 git apply/reverse 复现 49/3→52/0），已提交本树待持有人核验；worktree=issue-589-live-integrity，实现GLM
 - #590 | impl | blocked | A7.2-pr6b sidecar格+四格矩阵；前置#589
 <!-- READY:END -->
+
+> ## 2026-10-25 03:57 · #589/#590 fix-r4 ACK 收据与安全红探针配方（GLM glm-5.3-mb，wt=issue-589-live-integrity）
+> Grok r2 剩余三条 P2 的证据收口：① P2-2 消费端合同——既有证据核对适用（projector.rs 无生命周期状态、真实 TS oracle 3 个 terminal-alone success case（oracle.json:1404/1464/3563）在 ea8118/r3 全量 lib 均 ok），写闭环说明 `fix-r4/01-consumer-evidence-closure.md` 供下轮非作者复核，不造镜像测试。② P2-3 wire ACK——fixture 新增 ack-eof-recorder 模式（记录实际收到的每帧直到 stdin EOF），新用例 `validate_event_rejection_is_never_acked_on_the_wire` 断言拒绝路径 ACK 记录为空、应用 0、dispose 恰一次、子进程被回收；行为负控：premature-ACK 变异（拒绝前发 ACK+flush 屏障）使新用例因 ACK 断言转红（`peer received host frames …[{"method":"ack","lastAppliedSequence":0}]`）而非编译错，其余两条既有钩子用例仍绿；attempt-1 无 flush 的变异被错误路径 close 竞态丢弃、安全脚本按设计报「未转红」，该事实与 optional 写不保证送达一并如实记录。③ 历史 cp 配方标为不供复用，新增安全配方 red-probe-safe.py（核准确 HEAD/无未提交更改/输入SHA → git patch 真实 a/ b/ 标签 → apply --check/apply → 红必须失败 → reverse --check/reverse → SHA+git差量核对 → 绿），取消红探针按新配方有界复现一次：49 绿 3 红（同 fix-r3 三条负控）→ 回滚 SHA 恢复 → 52/0 绿；另补 suppress-before-hook、skip-final 两个位置变异均转红并干净回滚。验证：host 模块 107/0（4 次 hook 定向均 3/0）、全量 gateway lib 1321/0/48、fmt 干净、clippy -D warnings 0、parity README 冻结哈希 f8958a32… 一致、git diff --check 干净。产品提交 13bc3f0d（fixture+host/tests），仅本地未推送；不宣称 factory 总接线、四格矩阵、TS 实机对拍、真人验收或 formal 四角色完成。证据 `_tmp/20261025-issue-589-live-integrity/fix-r4/`（red-probe-safe-recipe.md、RESULT.md）。
+
+> ## 2026-10-25 03:34 · #589/#590 fix-r3 收尾（GLM glm-5.3-mb，wt=issue-589-live-integrity）
+> 持有人只读审 r2 的三条小修：① 红探针材料补全——r2 patch 只改 live.rs 缺测试构造器临时字段，本轮给出完整双文件配方（red-probe-build.py 锚点唯一断言 + 03-red-probe-mutation-complete.patch），在 checkpoint ea6f3e21 上有界复现三条取消负控转红（49 绿 3 红，失败测试与 r2 记录一致），还原后 cmp/shasum 逐字节验证（live.rs 4a9896…、live_stream_tests.rs 69708a…）并复测绿（52/0）。② StreamHandler.validate_event 在自身生命周期检查后转发 inner.validate_event，包装不静默丢弃 inner 拒绝语义；新增真实 LiveSession 用例：inner 拒绝合法 input_accepted 后事件不被 apply/发布、stream 以 inner 错误失败、dispose 恰一次。③ peer 新增 live-cancel-full-aborted（TS AgentLoop.ts:594-611 完整 result.type=aborted 模块 final），走 ExecuteResult::Terminal 权威终态分支而非 Aborted 合成分支；新增真实 Host/LiveSession 用例：终态恰投影一次、peer 原结果（turns=1、起止时间不同）/原消息保留、next→None、dispose 恰一次且子进程被回收；既有 compaction 用例保留，fix-r2 RESULT 的两者等同说法已更正。顺带修 Failed 状态旧注释。验证：定向 live 52/0（连跑 4 次）、全量 gateway lib 1320/0/48、fmt 干净、clippy -D warnings 0、parity README 冻结哈希 f8958a32… 一致、git diff --check 干净。Grok r2 独立增量审（review-grok-r2.md，VERDICT P0=0 P1=0 P2=3 P3=6）：无新 P0/P1；其 P2-1 即本轮②已修，P2-2 消费端合同、P2-3 ACK 断言/钩子位置变异超本轮窄范围，如实记剩余。日志覆写同类错误第三次（01/02/06）已按 AGENTS 在 state/memory/20261016-evidence-write-guard.md 沉淀独占创建规则，本轮全部命令日志经 capture-exclusive.py 独占创建。证据 `_tmp/20261025-issue-589-live-integrity/fix-r3/`（red-probe-recipe.md、RESULT.md）。本轮仅本地 commit 未推送，未宣称 formal run-review-roles 已过，不自行评审，不关闭 #589/#590。
+
+> ## 2026-10-25 03:08 · #589/#590 fix-r2 取消事实边界修正（GLM glm-5.3-mb，wt=issue-589-live-integrity）
+> 轮 1 的两条 P1 已修正：删除 `events_stopped_by_cancel_exit = cancellation.is_cancelled()` 宽容映射（取消请求本身不证明 host 走了 cancel exit 或 sidecar 少发了事件）。改为准确事实源：`HostHandler::validate_event` 同步 hook 在 host 接收路上（wire 身份/序列/payload 校验与非权威 turn_completed 抑制之后、入应用队列之前）观察收到的全部事件——即便其应用回调被 cancel exit 丢弃，lifecycle 也已被观察；`finish()` 对 module final 严格校验（success/max_turns→InputAccepted，error→Failed，aborted 任意，未知拒绝），取消不再改变任何判定。负控与红探针：peer.py 新增 live-cancel-pending-failure / live-missing-accepted / live-failed-then-success / live-failed-then-max-turns 四模式；红探针在修复之上临时复原轮 1 宽容逻辑，三条取消类负控转红（47 绿 3 红）、其余含合法 cancel-exit 用例保持绿，随后还原并复测绿（50/0）。producer 路径上队列中待决 turn_failed 可满足 error 终态（behind-pending-callback 测试）。原 P1 的第二次 turn_failed 属 TS 终结化重入合法（保留）；duplicate_lifecycle 测试修正为 turn_started/input_accepted 重复仍拒、turn_failed 重复允许。定向 live 50/0、host 106/0（含 hook 排序/先于应用失败两条新测试）、全量 lib 1318/0、fmt/clippy 0 警告、parity README 冻结哈希 f8958a32… 一致、`git diff --check` 干净。证据 `_tmp/20261025-issue-589-live-integrity/fix-r2/`（design.md、03 红探针 patch+log、RESULT.md）。本轮仅本地 commit 未推送，未宣称 formal run-review-roles 已过，不自行评审，不关闭 #589/#590。
+
+> ## 2026-10-25 02:14 · #589/#590 LiveSession 生产事件完整性接线（GLM glm-5.3-mb，wt=issue-589-live-integrity）
+> 完成有界实现：`runtime/turn/live.rs` 事件观察接入生产路径（select recv 与同 poll try_recv 两条排空路径）；StreamIntegrity 改为真实 lifecycle 机（turn_started 开流、input_accepted/turn_failed 恰一次、sidecar turn_completed 到达即违规、module final 唯一权威终态按 outcome 分流校验）；violation fail-closed 释放 execution/active slot/子进程。去掉正向测试的手工 integrity 预置，peer.py 扩出 live-normal/live-early-failure/live-cancel-compaction/live-duplicate-start 模式。定向 37/0、全量 lib 1303/0、fmt/clippy 过、parity README 冻结哈希一致。证据 `_tmp/20261025-issue-589-live-integrity/`，RESULT.md 在证据目录。Refs #589 #590，未宣称生产入口/四格矩阵/真实 provider 实效完成。待持有人核验、gitleaks、推送与两家非作者评审。
 
 > ## 2026-10-24 · #625 A5.2 原生观察面负控（Codex，wt-625-negctl）
 > 补齐 finishReason/runId/state/raw snapshot 四项指定标签负控，原生矩阵由 8 项增至 12 项；raw 先校验目标记录身份，再对齐完整 record/events，说明与 TS 预注册规则的映射及适用边界，不改冻结文件。下一步完成真实成功场景与全部反例复算、双非作者评审并合入；最终测试与收尾证据贴 #625 关联 PR。本轮不改变 A5.4 整体完成状态。

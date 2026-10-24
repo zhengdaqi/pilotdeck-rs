@@ -5,9 +5,20 @@
 //! recordAcceptedInput, the loop.run() generator yields AgentEvents until
 //! turn_completed.
 //!
-//! StreamIntegrity currently checks only the terminal completion sequence.
-//! Event observation is not wired here yet, so this adapter does not claim
-//! dropped-frame or duplicate-frame detection; unobserved terminals fail closed.
+//! StreamIntegrity tracks the turn lifecycle on top of the host's wire
+//! sequence/identity checks: turn_started must open the stream, input_accepted
+//! appears at most once, turn_failed may repeat (TurnRunner's catch re-emits it
+//! after a finalization failure) and the module final is the only authoritative
+//! terminal (the host already suppresses a sidecar's non-final turn_completed,
+//! agentLoopSidecarClient.ts:680-684). The lifecycle is observed by a
+//! synchronous `HostHandler::validate_event` hook on the host's receive path:
+//! every event that passed wire validation has been observed by the time the
+//! host returns a final, even when its application callback never completed —
+//! the host's bounded cancel exit (POST_CANCEL_EXIT_TIMEOUT) may drop queued
+//! applications while keeping the already-received final authoritative. The
+//! terminal is therefore validated strictly against the received lifecycle; a
+//! cancellation request alone never rescues a missing or contradictory one.
+//! It does not claim dropped-frame or duplicate-frame detection.
 
 use crate::{
     host::{
@@ -79,6 +90,10 @@ impl LiveSession for LiveSessionAdapter {
         let active = ActiveTurn(self.state.clone());
         let host_factory = self.host_factory.clone();
         let identity = request.identity.clone();
+        // Shared between the host-side validation hook (every received event)
+        // and finish()'s strict terminal check; see StreamHandler.
+        let integrity = Arc::new(StreamIntegrity::new());
+        let hook_integrity = integrity.clone();
         // Keep at most one delivered event ahead of the submit consumer.
         let (events, receiver) = mpsc::channel(1);
         Ok(Box::new(LiveTurnStream {
@@ -90,7 +105,11 @@ impl LiveSession for LiveSessionAdapter {
                         return Ok(ExecuteResult::Aborted { terminal: None });
                     }
                 };
-                let handler = Arc::new(StreamHandler { inner, events });
+                let handler = Arc::new(StreamHandler {
+                    inner,
+                    events,
+                    integrity: hook_integrity,
+                });
                 client
                     .execute_cancellable(request, handler, cancellation)
                     .await
@@ -99,7 +118,7 @@ impl LiveSession for LiveSessionAdapter {
             events: receiver,
             identity,
             input,
-            integrity: StreamIntegrity::new(),
+            integrity,
             active: Some(active),
         }))
     }
@@ -135,7 +154,9 @@ struct LiveTurnStream {
     events: mpsc::Receiver<JsValue>,
     identity: ExecutionIdentity,
     input: JsValue,
-    integrity: StreamIntegrity,
+    // The same instance the host-side hook observes into, so finish() checks
+    // the terminal against everything the sidecar actually sent.
+    integrity: Arc<StreamIntegrity>,
     // Release the active slot after the final/error is delivered, or on drop.
     active: Option<ActiveTurn>,
 }
@@ -143,16 +164,26 @@ struct LiveTurnStream {
 impl LiveTurn for LiveTurnStream {
     fn next(&mut self) -> SessionNext<'_> {
         Box::pin(async move {
+            let mut delivered = None;
             if let Some(execution) = self.execution.as_mut() {
-                self.result = Some(tokio::select! {
+                let mut settled = None;
+                tokio::select! {
                     // Drain events already applied by the handler before returning
                     // either the terminal or an execution error. A closed receiver
                     // disables this arm while execute finishes cleanup.
                     biased;
-                    Some(event) = self.events.recv() => return Ok(Some(event)),
-                    result = execution => result,
-                });
-                self.execution = None;
+                    Some(event) = self.events.recv() => {
+                        delivered = Some(event);
+                    }
+                    result = execution => settled = Some(result),
+                }
+                if let Some(result) = settled {
+                    self.result = Some(result);
+                    self.execution = None;
+                }
+            }
+            if let Some(event) = delivered {
+                return Ok(Some(event));
             }
             // execute may have queued an event in the very poll that completed
             // it, after select already polled recv. Keep its result for next().
@@ -178,8 +209,20 @@ impl LiveTurnStream {
     ) -> Result<Option<JsValue>, RuntimeError> {
         match result {
             Ok(ExecuteResult::Terminal(terminal)) => {
-                // Event observation remains deferred to A7.2-pr6b.
-                self.integrity.observe_terminal()?;
+                let outcome = terminal
+                    .get("payload")
+                    .and_then(|payload| payload.get("result"))
+                    .and_then(|result| result.get("type"))
+                    .and_then(JsValue::as_string);
+                // Strict check against everything the host received. The
+                // host's bounded cancel exit (POST_CANCEL_EXIT_TIMEOUT,
+                // host/execution.rs) may stop applying events and return an
+                // already-validated final while queued applications are lost —
+                // but their lifecycle was still observed by the receive-path
+                // hook, so a missing input_accepted or turn_failed here is a
+                // sidecar violation, not a host cleanup fact, and cancellation
+                // changes nothing.
+                self.integrity.observe_terminal(outcome)?;
                 Ok(Some(self.completed_event(
                     terminal.get("payload").unwrap_or(&JsValue::Undefined),
                 )))
@@ -260,14 +303,43 @@ impl LiveTurnStream {
 }
 
 /// Preserve host module/lifecycle behavior while exposing applied AgentEvents.
+///
+/// Ordering boundary: `validate_event` observes each event's lifecycle on the
+/// host's receive path, before the inner (module-side) handler applies it and
+/// before the host ACKs it. A violating event therefore never reaches the
+/// inner handler, and a misbehaving sidecar is cut off at its first violating
+/// event. `event` awaits `applied` and only then forwards the payload, so the
+/// consumer only ever publishes events that were applied successfully — but
+/// the integrity state may be ahead of what the consumer has pulled: events
+/// whose application callback never completed (including the whole queue
+/// dropped by the host's bounded cancel exit) are still observed. `finish()`
+/// validates the terminal against that received lifecycle, never against the
+/// delivered prefix.
+///
+/// `validate_event` forwards to `inner.validate_event` after its own lifecycle
+/// check: an inner handler that rejects a payload keeps exactly its rejection
+/// semantics when wrapped (the wrapper never silently skips it), and either
+/// rejection fails the receive path before application and ACK.
 struct StreamHandler {
     inner: Arc<dyn HostHandler>,
     events: mpsc::Sender<JsValue>,
+    integrity: Arc<StreamIntegrity>,
 }
 
 impl HostHandler for StreamHandler {
     fn module_call(&self, call: JsValue) -> HostFuture<JsObject> {
         self.inner.module_call(call)
+    }
+
+    fn validate_event(&self, payload: &JsValue) -> Result<(), HostError> {
+        // Own lifecycle check first: an invalid event is cut off before the
+        // inner contract sees it, exactly like it is cut off before
+        // application. Then forward the inner handler's validation so wrapping
+        // it never drops a rejection a directly-embedded handler enforces.
+        self.integrity
+            .observe_event(payload)
+            .map_err(|error| HostError::new(HostErrorKind::Protocol, error.message))?;
+        self.inner.validate_event(payload)
     }
 
     fn event(&self, event: JsValue) -> HostFuture<()> {
@@ -299,20 +371,29 @@ impl HostHandler for StreamHandler {
     }
 }
 
-/// Terminal sequence validation only. Event observation is not yet wired into
-/// production, so an unobserved non-aborted terminal is rejected fail-closed.
+/// Turn lifecycle validation against the TurnRunner baseline. The host layer
+/// owns wire sequence/identity; this machine only tracks lifecycle order:
+/// turn_started opens the turn, input_accepted and turn_failed appear at most
+/// once each in that order, and the authoritative terminal is projected exactly
+/// once by the session from ExecuteResult. It does not detect unknown dropped
+/// frames; the host's strict sequence check (client:879-893) owns that.
 struct StreamIntegrity {
     state: Mutex<IntegrityState>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 enum IntegrityState {
+    /// No AgentEvent observed yet.
     Initial,
+    /// turn_started observed.
     Started,
+    /// input_accepted observed after turn_started.
     InputAccepted,
-    #[allow(dead_code)]
-    Terminal,
+    /// turn_failed observed; it may legally repeat (TurnRunner's catch
+    /// re-emits it after a finalization failure) and intermediate events may
+    /// still arrive before the terminal.
+    Failed,
+    /// The authoritative terminal has been projected from ExecuteResult.
     Completed,
 }
 
@@ -323,50 +404,126 @@ impl StreamIntegrity {
         }
     }
 
-    #[allow(dead_code)]
-    fn observe_event(&self, event_type: &str) -> Result<(), RuntimeError> {
+    /// Observe one AgentEvent received by the host (called from the
+    /// `validate_event` hook on the receive path, in wire order, before the
+    /// event is applied). Non-lifecycle events (model/tool/status/steer/
+    /// file_artifacts/...) are legal while the turn is running; only their
+    /// position relative to the lifecycle events and the terminal is
+    /// constrained.
+    fn observe_event(&self, event: &JsValue) -> Result<(), RuntimeError> {
+        let Some(event_type) = event.get("type").and_then(JsValue::as_string) else {
+            return Err(RuntimeError::new(
+                "Stream integrity violation: AgentEvent without a type.",
+            ));
+        };
+        let name = String::from_utf16_lossy(event_type.units());
         let mut state = self.state.lock().unwrap();
-
-        match (*state, event_type) {
-            (IntegrityState::Initial, "turn_started") => {
-                *state = IntegrityState::Started;
+        // TurnRunner.ts:150: turn_started is always the first AgentEvent.
+        if event_type.equals_str("turn_started") {
+            return match *state {
+                IntegrityState::Initial => {
+                    *state = IntegrityState::Started;
+                    Ok(())
+                }
+                other => Err(RuntimeError::new(format!(
+                    "Stream integrity violation: turn_started after the turn already opened (state: {other:?})."
+                ))),
+            };
+        }
+        // TurnRunner.ts:217: input_accepted follows turn_started exactly once.
+        if event_type.equals_str("input_accepted") {
+            return match *state {
+                IntegrityState::Started => {
+                    *state = IntegrityState::InputAccepted;
+                    Ok(())
+                }
+                other => Err(RuntimeError::new(format!(
+                    "Stream integrity violation: input_accepted out of order (state: {other:?})."
+                ))),
+            };
+        }
+        // TurnRunner.ts:209,256,282,437: turn_failed precedes the terminal,
+        // possibly before input_accepted (transcript write failure). A second
+        // turn_failed is legal: TurnRunner.ts:397-402 forwards the loop's
+        // turn_failed, and if a post-loop finalization step (:408-419) then
+        // throws, the catch (:437) yields another turn_failed before the same
+        // error terminal. hasRecordedVisibleFailureStatus dedupes only the
+        // status event, not turn_failed itself.
+        if event_type.equals_str("turn_failed") {
+            return match *state {
+                IntegrityState::Started | IntegrityState::InputAccepted => {
+                    *state = IntegrityState::Failed;
+                    Ok(())
+                }
+                IntegrityState::Failed => Ok(()),
+                other => Err(RuntimeError::new(format!(
+                    "Stream integrity violation: turn_failed out of order (state: {other:?})."
+                ))),
+            };
+        }
+        // The host suppresses a sidecar's non-final turn_completed
+        // (agentLoopSidecarClient.ts:680-684); only the module final projected
+        // by this session is authoritative, so one reaching here is a
+        // double-published terminal.
+        if event_type.equals_str("turn_completed") {
+            return Err(RuntimeError::new(
+                "Stream integrity violation: sidecar turn_completed must not reach the session stream; the module final is the authoritative terminal.",
+            ));
+        }
+        match *state {
+            IntegrityState::Started | IntegrityState::InputAccepted | IntegrityState::Failed => {
                 Ok(())
             }
-            (IntegrityState::Started, "input_accepted") => {
-                *state = IntegrityState::InputAccepted;
-                Ok(())
-            }
-            (IntegrityState::InputAccepted, "turn_completed") => {
-                *state = IntegrityState::Completed;
-                Ok(())
-            }
-            (IntegrityState::Completed, _) => Err(RuntimeError::new(format!(
-                "Stream integrity violation: event '{}' after turn_completed (premature final)",
-                event_type
+            IntegrityState::Initial => Err(RuntimeError::new(format!(
+                "Stream integrity violation: event '{name}' before turn_started."
             ))),
-            (current, event) => {
-                // Duplicate or out-of-order event
-                Err(RuntimeError::new(format!(
-                    "Stream integrity violation: unexpected event '{}' in state {:?}",
-                    event, current
-                )))
-            }
+            IntegrityState::Completed => Err(RuntimeError::new(format!(
+                "Stream integrity violation: event '{name}' after the terminal (premature final)."
+            ))),
         }
     }
 
-    fn observe_terminal(&self) -> Result<(), RuntimeError> {
-        let state = self.state.lock().unwrap();
-        match *state {
-            IntegrityState::Completed => Ok(()),
-            other => Err(RuntimeError::new(format!(
-                "Stream integrity violation: terminal without proper completion sequence (state: {:?})",
-                other
-            ))),
+    /// Observe the authoritative terminal projected from ExecuteResult.
+    /// `outcome` is the terminal result's type (success/error/max_turns/aborted).
+    /// The check is strict against the lifecycle received on the wire (the
+    /// receive-path hook observed every event the host accepted, applied or
+    /// not): a cancellation request alone never rescues a missing or
+    /// contradictory lifecycle, because the host's cancel exit only drops
+    /// unapplied applications, never received events. The final itself was
+    /// already validated by the host layer.
+    fn observe_terminal(&self, outcome: Option<&JsString>) -> Result<(), RuntimeError> {
+        let outcome = outcome.map(|outcome| String::from_utf16_lossy(outcome.units()));
+        let mut state = self.state.lock().unwrap();
+        let current = *state;
+        let accepted = match outcome.as_deref() {
+            // Cancellation may stop a turn at any point, including before
+            // turn_started reached the session (cancel before execute).
+            Some("aborted") => true,
+            // TurnRunner.ts:217: a successful loop always accepted input.
+            Some("success") => current == IntegrityState::InputAccepted,
+            // TurnRunner.ts:209,256,282,437: every error path yields turn_failed.
+            Some("error") => current == IntegrityState::Failed,
+            // AgentLoop.ts:2213-2224: max_turns yields status + turn_completed
+            // only, without turn_failed; input was still accepted.
+            Some("max_turns") => current == IntegrityState::InputAccepted,
+            // The host never validates unknown outcomes into a terminal.
+            _ => false,
+        };
+        if accepted {
+            *state = IntegrityState::Completed;
+            Ok(())
+        } else {
+            Err(RuntimeError::new(format!(
+                "Stream integrity violation: terminal without proper lifecycle (outcome: {:?}, state: {current:?}).",
+                outcome
+            )))
         }
     }
 
     fn observe_aborted(&self) -> Result<(), RuntimeError> {
-        // Aborted turns may not have completed the full sequence
+        // Aborted turns may stop before any lifecycle event was observed,
+        // including an input cancelled before execute was sent.
+        *self.state.lock().unwrap() = IntegrityState::Completed;
         Ok(())
     }
 }
@@ -424,58 +581,355 @@ fn map_host_error(error: HostError) -> RuntimeError {
 mod tests {
     use super::*;
 
-    #[test]
-    fn stream_integrity_valid_sequence() {
-        let integrity = StreamIntegrity::new();
-        assert!(integrity.observe_event("turn_started").is_ok());
-        assert!(integrity.observe_event("input_accepted").is_ok());
-        assert!(integrity.observe_event("turn_completed").is_ok());
-        assert!(integrity.observe_terminal().is_ok());
+    fn event_of(event_type: &str) -> JsValue {
+        parse_json(&format!(r#"{{"type":"{event_type}"}}"#)).unwrap()
+    }
+
+    fn outcome(kind: &str) -> Option<JsString> {
+        Some(JsString::from(kind))
     }
 
     #[test]
-    fn stream_integrity_detects_premature_final() {
+    fn success_sequence_with_intermediate_events_is_accepted() {
         let integrity = StreamIntegrity::new();
-        integrity.observe_event("turn_started").unwrap();
-        integrity.observe_event("input_accepted").unwrap();
-        integrity.observe_event("turn_completed").unwrap();
+        integrity.observe_event(&event_of("turn_started")).unwrap();
+        integrity
+            .observe_event(&event_of("input_accepted"))
+            .unwrap();
+        integrity.observe_event(&event_of("model_event")).unwrap();
+        integrity.observe_event(&event_of("agent_status")).unwrap();
+        integrity.observe_event(&event_of("tool_progress")).unwrap();
+        integrity
+            .observe_event(&event_of("file_artifacts"))
+            .unwrap();
+        integrity
+            .observe_event(&event_of("steer_unapplied"))
+            .unwrap();
+        assert!(
+            integrity
+                .observe_terminal(outcome("success").as_ref())
+                .is_ok()
+        );
+    }
 
-        // Event after turn_completed should fail
-        let result = integrity.observe_event("thinking");
+    #[test]
+    fn early_failure_before_input_accepted_is_accepted() {
+        // TurnRunner.ts:208-210: a transcript write failure ends the turn
+        // before input_accepted with status, turn_failed, then the terminal.
+        let integrity = StreamIntegrity::new();
+        integrity.observe_event(&event_of("turn_started")).unwrap();
+        integrity.observe_event(&event_of("agent_status")).unwrap();
+        integrity.observe_event(&event_of("turn_failed")).unwrap();
+        assert!(
+            integrity
+                .observe_terminal(outcome("error").as_ref())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn failure_after_input_accepted_is_accepted() {
+        let integrity = StreamIntegrity::new();
+        integrity.observe_event(&event_of("turn_started")).unwrap();
+        integrity
+            .observe_event(&event_of("input_accepted"))
+            .unwrap();
+        integrity.observe_event(&event_of("turn_failed")).unwrap();
+        // Legal tail events after turn_failed (TurnRunner.ts:431-438).
+        integrity
+            .observe_event(&event_of("file_artifacts"))
+            .unwrap();
+        integrity
+            .observe_event(&event_of("steer_unapplied"))
+            .unwrap();
+        assert!(
+            integrity
+                .observe_terminal(outcome("error").as_ref())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn second_turn_failed_before_the_error_terminal_is_accepted() {
+        // TurnRunner.ts:397-402 forwards the loop's turn_failed; a post-loop
+        // finalization step (:408-419) may then throw, and the catch (:437)
+        // yields a second turn_failed before the same error terminal (:439).
+        // hasRecordedVisibleFailureStatus dedupes only the status event, so
+        // two turn_failed events are a legal TS stream.
+        let integrity = StreamIntegrity::new();
+        integrity.observe_event(&event_of("turn_started")).unwrap();
+        integrity
+            .observe_event(&event_of("input_accepted"))
+            .unwrap();
+        integrity.observe_event(&event_of("turn_failed")).unwrap();
+        integrity.observe_event(&event_of("turn_failed")).unwrap();
+        assert!(
+            integrity
+                .observe_terminal(outcome("error").as_ref())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn max_turns_terminal_requires_no_turn_failed() {
+        // AgentLoop.ts:2213-2224: max_turns yields status + turn_completed
+        // only; requiring turn_failed here would falsely reject it.
+        let integrity = StreamIntegrity::new();
+        integrity.observe_event(&event_of("turn_started")).unwrap();
+        integrity
+            .observe_event(&event_of("input_accepted"))
+            .unwrap();
+        integrity.observe_event(&event_of("model_event")).unwrap();
+        assert!(
+            integrity
+                .observe_terminal(outcome("max_turns").as_ref())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn event_before_turn_started_is_rejected() {
+        let integrity = StreamIntegrity::new();
+        let result = integrity.observe_event(&event_of("model_event"));
         assert!(result.is_err());
-        assert!(result.unwrap_err().message.contains("premature final"));
+        assert!(result.unwrap_err().message.contains("before turn_started"));
+        // The terminal still fails closed afterwards.
+        integrity.observe_event(&event_of("turn_started")).unwrap();
+        integrity
+            .observe_event(&event_of("input_accepted"))
+            .unwrap();
+        assert!(
+            integrity
+                .observe_terminal(outcome("success").as_ref())
+                .is_ok()
+        );
     }
 
     #[test]
-    fn stream_integrity_detects_missing_start() {
+    fn duplicate_lifecycle_events_are_rejected() {
+        // A second turn_started after the turn already opened.
         let integrity = StreamIntegrity::new();
+        integrity.observe_event(&event_of("turn_started")).unwrap();
+        let result = integrity.observe_event(&event_of("turn_started"));
+        assert!(result.unwrap_err().message.contains("already opened"));
 
-        // Skipping turn_started should fail
-        let result = integrity.observe_event("input_accepted");
+        // A second input_accepted after the turn is running.
+        let integrity = StreamIntegrity::new();
+        integrity.observe_event(&event_of("turn_started")).unwrap();
+        integrity
+            .observe_event(&event_of("input_accepted"))
+            .unwrap();
+        let result = integrity.observe_event(&event_of("input_accepted"));
+        assert!(result.unwrap_err().message.contains("out of order"));
+
+        // A repeated turn_failed is NOT a duplicate: TurnRunner's catch may
+        // re-emit it after a finalization failure before the same error
+        // terminal (TurnRunner.ts:397-402, :437), unlike turn_started and
+        // input_accepted, which appear exactly once.
+        let integrity = StreamIntegrity::new();
+        integrity.observe_event(&event_of("turn_started")).unwrap();
+        integrity.observe_event(&event_of("turn_failed")).unwrap();
+        integrity.observe_event(&event_of("turn_failed")).unwrap();
+        assert!(
+            integrity
+                .observe_terminal(outcome("error").as_ref())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn input_accepted_before_turn_started_is_rejected() {
+        let integrity = StreamIntegrity::new();
+        let result = integrity.observe_event(&event_of("input_accepted"));
         assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("out of order"));
     }
 
     #[test]
-    fn stream_integrity_detects_incomplete_terminal() {
+    fn turn_failed_before_turn_started_is_rejected() {
         let integrity = StreamIntegrity::new();
-        integrity.observe_event("turn_started").unwrap();
+        assert!(integrity.observe_event(&event_of("turn_failed")).is_err());
+    }
 
-        // Terminal without turn_completed should fail
-        let result = integrity.observe_terminal();
+    #[test]
+    fn sidecar_turn_completed_is_rejected_as_non_authoritative() {
+        let integrity = StreamIntegrity::new();
+        integrity.observe_event(&event_of("turn_started")).unwrap();
+        integrity
+            .observe_event(&event_of("input_accepted"))
+            .unwrap();
+        let result = integrity.observe_event(&event_of("turn_completed"));
         assert!(result.is_err());
         assert!(
             result
                 .unwrap_err()
                 .message
-                .contains("without proper completion")
+                .contains("the module final is the authoritative terminal")
         );
     }
 
     #[test]
-    fn stream_integrity_allows_aborted() {
+    fn event_after_terminal_is_rejected() {
         let integrity = StreamIntegrity::new();
-        // Aborted turns don't require full sequence
-        assert!(integrity.observe_aborted().is_ok());
+        integrity.observe_event(&event_of("turn_started")).unwrap();
+        integrity
+            .observe_event(&event_of("input_accepted"))
+            .unwrap();
+        integrity
+            .observe_terminal(outcome("success").as_ref())
+            .unwrap();
+        let result = integrity.observe_event(&event_of("model_event"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("premature final"));
+    }
+
+    #[test]
+    fn event_without_a_type_is_rejected() {
+        let integrity = StreamIntegrity::new();
+        let result = integrity.observe_event(&JsValue::Object(JsObject::new()));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("without a type"));
+    }
+
+    #[test]
+    fn success_terminal_without_input_accepted_is_rejected() {
+        let integrity = StreamIntegrity::new();
+        integrity.observe_event(&event_of("turn_started")).unwrap();
+        let result = integrity.observe_terminal(outcome("success").as_ref());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("proper lifecycle"));
+    }
+
+    #[test]
+    fn error_terminal_without_turn_failed_is_rejected() {
+        let integrity = StreamIntegrity::new();
+        integrity.observe_event(&event_of("turn_started")).unwrap();
+        integrity
+            .observe_event(&event_of("input_accepted"))
+            .unwrap();
+        let result = integrity.observe_terminal(outcome("error").as_ref());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("proper lifecycle"));
+    }
+
+    #[test]
+    fn success_terminal_after_turn_failed_is_rejected() {
+        let integrity = StreamIntegrity::new();
+        integrity.observe_event(&event_of("turn_started")).unwrap();
+        integrity
+            .observe_event(&event_of("input_accepted"))
+            .unwrap();
+        integrity.observe_event(&event_of("turn_failed")).unwrap();
+        assert!(
+            integrity
+                .observe_terminal(outcome("success").as_ref())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn unknown_terminal_outcome_is_rejected() {
+        let integrity = StreamIntegrity::new();
+        integrity.observe_event(&event_of("turn_started")).unwrap();
+        integrity
+            .observe_event(&event_of("input_accepted"))
+            .unwrap();
+        assert!(
+            integrity
+                .observe_terminal(outcome("surprise").as_ref())
+                .is_err()
+        );
+        assert!(integrity.observe_terminal(None).is_err());
+    }
+
+    #[test]
+    fn second_terminal_projection_is_rejected() {
+        let integrity = StreamIntegrity::new();
+        integrity.observe_event(&event_of("turn_started")).unwrap();
+        integrity
+            .observe_event(&event_of("input_accepted"))
+            .unwrap();
+        integrity
+            .observe_terminal(outcome("success").as_ref())
+            .unwrap();
+        assert!(
+            integrity
+                .observe_terminal(outcome("success").as_ref())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn aborted_terminal_is_accepted_from_any_state() {
+        for observations in [
+            Vec::<&str>::new(),
+            vec!["turn_started"],
+            vec!["turn_started", "input_accepted"],
+            vec!["turn_started", "input_accepted", "turn_failed"],
+        ] {
+            let integrity = StreamIntegrity::new();
+            for event_type in &observations {
+                integrity.observe_event(&event_of(event_type)).unwrap();
+            }
+            assert!(
+                integrity
+                    .observe_terminal(outcome("aborted").as_ref())
+                    .is_ok()
+            );
+            assert!(integrity.observe_aborted().is_ok());
+            // After an aborted terminal the stream is closed.
+            assert!(integrity.observe_event(&event_of("model_event")).is_err());
+        }
+    }
+
+    #[test]
+    fn max_turns_terminal_after_turn_failed_is_rejected() {
+        // turn_failed is only ever followed by the same error terminal
+        // (TurnRunner.ts:437-439); a max_turns final after it contradicts the
+        // loop's max-turns path, which never emits turn_failed
+        // (AgentLoop.ts:2218-2233).
+        let integrity = StreamIntegrity::new();
+        integrity.observe_event(&event_of("turn_started")).unwrap();
+        integrity
+            .observe_event(&event_of("input_accepted"))
+            .unwrap();
+        integrity.observe_event(&event_of("turn_failed")).unwrap();
+        assert!(
+            integrity
+                .observe_terminal(outcome("max_turns").as_ref())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_final_missing_lifecycle_is_rejected_from_every_state() {
+        // No cancellation flag can rescue these: the receive-path hook observed
+        // what the sidecar actually sent, so a missing input_accepted or
+        // turn_failed is a sidecar violation regardless of host cleanup.
+        for observations in [Vec::<&str>::new(), vec!["turn_started"]] {
+            for kind in ["success", "max_turns"] {
+                let integrity = StreamIntegrity::new();
+                for event_type in &observations {
+                    integrity.observe_event(&event_of(event_type)).unwrap();
+                }
+                assert!(
+                    integrity.observe_terminal(outcome(kind).as_ref()).is_err(),
+                    "{kind} after {observations:?} must require input_accepted"
+                );
+            }
+        }
+        for observations in [Vec::<&str>::new(), vec!["turn_started"]] {
+            let integrity = StreamIntegrity::new();
+            for event_type in &observations {
+                integrity.observe_event(&event_of(event_type)).unwrap();
+            }
+            assert!(
+                integrity
+                    .observe_terminal(outcome("error").as_ref())
+                    .is_err(),
+                "error after {observations:?} must require turn_failed"
+            );
+        }
     }
 }
 
